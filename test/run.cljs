@@ -83,6 +83,53 @@
                     (str "cold writer requests=" requests
                          " stored blocks=" blocks))))))))
 
+(defn- crash-before-cas-and-retry [backend]
+  (let [old-root (atom nil)
+        failing
+        (reify
+          storage/IBlockStore
+          (-put-blocks! [_ blocks] (storage/-put-blocks! backend blocks))
+          (-get-blocks [_ cids] (storage/-get-blocks backend cids))
+          storage/IRefStore
+          (-read-ref [_ name] (storage/-read-ref backend name))
+          (-compare-and-set-ref! [_ _name _expected _next]
+            (js/Promise.reject
+             (js/Error. "simulated crash after upload, before CAS")))
+          storage/IBackendCapabilities
+          (-capabilities [_] (storage/-capabilities backend)))
+        request {:database-id "async/db" :request-id "crash-retry"
+                 :tx-data [[:db/add "crash-marker" :status :recovered]]}
+        failed-writer (provider/engine-from-backend failing crypto)]
+    (-> (provider/restore-head failed-writer failing "main")
+        (.then
+         (fn [restored]
+           (reset! old-root (:physical-root restored))
+           (provider/transact-and-publish!
+            failed-writer failing "main" restored request)))
+        (.then
+         (fn [_]
+           (throw (js/Error. "fault injection unexpectedly published"))))
+        (.catch
+         (fn [error]
+           (check (= "simulated crash after upload, before CAS" (.-message error))
+                  "fault injection reached the post-upload/pre-CAS boundary")
+           (-> (storage/-read-ref backend "main")
+               (.then
+                (fn [head]
+                  (check (= @old-root (:cid head))
+                         "failed publish leaves the previous head authoritative")
+                  (let [retry-writer
+                        (provider/engine-from-backend backend crypto)]
+                    (-> (provider/restore-head retry-writer backend "main")
+                        (.then
+                         (fn [restored]
+                           (provider/transact-and-publish!
+                            retry-writer backend "main" restored request)))
+                        (.then
+                         (fn [published]
+                           (check (= :published (:publish-status published))
+                                  "fresh process safely retries the same request")))))))))))))
+
 (defn main []
   (let [backend (->AsyncStore (atom {}) (atom {}))
         writer (provider/engine-from-backend backend crypto)
@@ -96,7 +143,8 @@
         (.then (fn [published]
                  (check (= :published (:publish-status published))
                         "immutable blocks publish before CAS")
-                 (cold-mutate backend)))
+                 (crash-before-cas-and-retry backend)))
+        (.then (fn [_] (cold-mutate backend)))
         (.then (fn [_] (verify-read backend)))
         (.then (fn [_] (println "kotobase-engine-prolly cljs: all green")))
         (.catch (fn [error]
