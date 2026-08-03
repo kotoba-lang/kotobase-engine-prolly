@@ -95,8 +95,8 @@
                      :format (get node "format-version")})))
   node)
 
-(defrecord ProllyEngine [put! get-fn blind-fn encrypt-fn decrypt-fn digest-fn
-                         scan-snapshot-fn]
+(defrecord ProllyEngine [put! get-fn commit-get-fn blind-fn encrypt-fn
+                         decrypt-fn digest-fn scan-snapshot-fn]
   contract/IEngine
   (-engine-profile [_] prolly-profile)
 
@@ -156,7 +156,8 @@
                           {:type :kotobase.engine/idempotency-conflict
                            :request-id request-id})))
         (let [t (inc (:basis-t state))
-              db (reduce apply-datom (:db state) tx)
+              db (when-some [materialized (:db state)]
+                   (reduce apply-datom materialized tx))
               previous-snapshot (get-in state [:snapshots (:basis-t state)])
               final-operations (->> tx
                                     (reduce (fn [ops datom]
@@ -178,7 +179,7 @@
                              tx)]
           (completion/then-result
            (arrangement/commit-changes!
-            put! get-fn previous-snapshot
+            put! commit-get-fn previous-snapshot
             {:assertions assertions :retractions retractions}
             arrangement/current-schema-version blind-fn encrypt-fn)
            (fn [snapshot-root]
@@ -260,7 +261,7 @@
         :engine prolly-profile}))))
 
 (defn prolly-engine
-  [{:keys [put! get-fn blind-fn encrypt-fn decrypt-fn digest-fn
+  [{:keys [put! get-fn commit-get-fn blind-fn encrypt-fn decrypt-fn digest-fn
            scan-snapshot-fn] :as opts}]
   (doseq [[k f] [[:put! put!] [:get-fn get-fn] [:blind-fn blind-fn]
                  [:encrypt-fn encrypt-fn] [:decrypt-fn decrypt-fn]
@@ -269,5 +270,5 @@
       (throw (ex-info "Prolly engine requires injected capabilities"
                       {:type :kotobase.engine/missing-capability
                        :capability k :provided (keys opts)}))))
-  (->ProllyEngine put! get-fn blind-fn encrypt-fn decrypt-fn digest-fn
-                  scan-snapshot-fn))
+  (->ProllyEngine put! get-fn (or commit-get-fn get-fn) blind-fn encrypt-fn
+                  decrypt-fn digest-fn scan-snapshot-fn))
