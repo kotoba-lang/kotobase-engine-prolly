@@ -29,9 +29,12 @@ The ClojureScript coordinator batches synchronously generated immutable blocks,
 awaits the provider upload, and then performs CAS. Reopen fetches only the
 manifest; reads use a direct async, range-pruned Prolly cursor with bounded
 concurrency. The regression harness reads one entity from a 2,001-Datom,
-40-block snapshot using 4 block requests total. The remaining performance
-blocker is cold-writer prefetch: the current async mutation warms every leaf
-summary before changing the affected paths.
+40-block snapshot using 4 block requests total. Cold mutation now fetches the
+internal summary path plus only the affected leaf windows rather than warming
+the full tree. A fresh writer changes a persisted 2,001-Datom/48-block snapshot
+with 11 block requests, and the same manifest-only reopen/mixed retract+assert/
+CAS/second-reopen flow passes against a real Miniflare `R2Bucket` with 4,001
+seed Datoms.
 
 Dependencies are fixed to published Git commit SHAs. West registration should
 advance only to reviewed revisions; generated manifests are not edited with

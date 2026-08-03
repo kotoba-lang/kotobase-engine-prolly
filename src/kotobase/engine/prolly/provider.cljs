@@ -1,7 +1,7 @@
 (ns kotobase.engine.prolly.provider
   "ClojureScript/R2 coordinator. Blocks are constructed into a synchronous
-  local batch, uploaded durably, and only then exposed by CAS. Restore uses an
-  explicit missing-block retry bridge until Arrangement gains an async cursor."
+  local batch, uploaded durably, and only then exposed by CAS. Reads and cold
+  writes use direct asynchronous, CID-checked block fetches."
   (:require [kotobase.engine.contract :as engine]
             [kotobase.engine.prolly :as prolly]
             [kotobase.engine.prolly.cursor :as cursor]
@@ -34,13 +34,28 @@
         (fn [cid]
           (swap! requests inc)
           (-> (storage/-get-blocks backend [cid])
-              (.then #(get % cid))))
+              (.then (fn [blocks]
+                       (if-some [bytes (get blocks cid)]
+                         bytes
+                         (throw
+                          (ex-info "content-addressed block was not found"
+                                   {:type :kotobase.engine/block-not-found
+                                    :cid cid})))))))
+        commit-get-fn
+        (fn [cid]
+          (if-some [bytes (get @cache cid)]
+            (js/Promise.resolve bytes)
+            (-> (async-get-fn cid)
+                (.then (fn [bytes]
+                         (when bytes (swap! cache assoc cid bytes))
+                         bytes)))))
         scan-snapshot-fn
         (fn [snapshot-root history basis-t pattern opts]
           (cursor/scan async-get-fn (:blind-fn crypto) (:decrypt-fn crypto)
                        snapshot-root history basis-t pattern opts))
         eng (prolly/prolly-engine
              (merge {:put! put! :get-fn get-fn
+                     :commit-get-fn commit-get-fn
                      :scan-snapshot-fn scan-snapshot-fn}
                     crypto))]
     (with-meta eng
@@ -70,10 +85,6 @@
                        cid (:cid head)]
                    (-> (async-get-fn cid)
                        (.then (fn [bytes]
-                                (when-not bytes
-                                  (throw (ex-info "published manifest is missing"
-                                                  {:type :kotobase.engine/block-not-found
-                                                   :cid cid})))
                                 (swap! cache assoc cid bytes)
                                 (engine/restore-state eng cid {:lazy? true})))))
                  nil)))))

@@ -2,9 +2,9 @@
  :deps {io.github.kotoba-lang/kotobase-engine-contract
         {:git/sha "e4e6087ebee641d3bde11a7e2aa618d283d296e2"}
         io.github.kotoba-lang/arrangement
-        {:git/sha "dca49a45b8e7d9698374558ddfec93d10b91d6dc"}
+        {:git/sha "1a3d835b58d5d92392fdafcb8ee82a60c7f18db7"}
         io.github.kotoba-lang/prolly-tree
-        {:git/sha "1d2e53990b3da798be522002112ee3ea45a29f5c"}
+        {:git/sha "7906ae8dd17ce349bd5696532df7ebaa1e2f1498"}
         io.github.kotoba-lang/kotobase-storage
         {:git/sha "f41e7bd3dfc8547614c6adc843c9d5fd1290687f"}}
  :aliases

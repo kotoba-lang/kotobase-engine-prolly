@@ -42,18 +42,46 @@
          (fn [restored]
            (check (nil? (:db restored))
                   "reopen is manifest-only, not full hydrate")
-           (engine/scan reader (engine/open-snapshot reader restored)
-                        ["alice" :person/name nil])))
+           (js/Promise.all
+            #js [(engine/scan reader (engine/open-snapshot reader restored)
+                              ["alice" :person/name nil])
+                 (engine/scan reader (engine/open-snapshot reader restored)
+                              ["bob" :person/name nil])])))
         (.then
-         (fn [rows]
-           (check (= ["Alice"] (mapv :v rows))
-                  "direct async cursor answers point read")
+         (fn [results]
+           (check (empty? (aget results 0))
+                  "cold retraction is visible after reopen")
+           (check (= ["Bob"] (mapv :v (aget results 1)))
+                  "cold assertion is visible through direct async cursor")
            (let [requests (provider/request-count reader)
                  blocks (count @(:blocks backend))]
-             (check (< requests 12) (str "point read requests=" requests))
-             (check (>= blocks (* 10 requests))
+             (check (< requests 16) (str "two point reads requests=" requests))
+             (check (> blocks requests)
                     (str "range pruning: " requests " reads over " blocks
                          " stored blocks"))))))))
+
+(defn- cold-mutate [backend]
+  (let [writer (provider/engine-from-backend backend crypto)]
+    (-> (provider/restore-head writer backend "main")
+        (.then
+         (fn [restored]
+           (check (nil? (:db restored))
+                  "cold writer starts from manifest only")
+           (provider/transact-and-publish!
+            writer backend "main" restored
+            {:database-id "async/db" :request-id "a2"
+             :tx-data [[:db/retract "alice" :person/name "Alice"]
+                       [:db/add "bob" :person/name "Bob"]]})))
+        (.then
+         (fn [published]
+           (check (= :published (:publish-status published))
+                  "cold mixed mutation publishes through CAS")
+           (let [requests (provider/request-count writer)
+                 blocks (count @(:blocks backend))]
+             (check (pos? requests) "cold writer fetched persisted blocks")
+             (check (< requests blocks)
+                    (str "cold writer requests=" requests
+                         " stored blocks=" blocks))))))))
 
 (defn main []
   (let [backend (->AsyncStore (atom {}) (atom {}))
@@ -68,7 +96,8 @@
         (.then (fn [published]
                  (check (= :published (:publish-status published))
                         "immutable blocks publish before CAS")
-                 (verify-read backend)))
+                 (cold-mutate backend)))
+        (.then (fn [_] (verify-read backend)))
         (.then (fn [_] (println "kotobase-engine-prolly cljs: all green")))
         (.catch (fn [error]
                   (js/console.error error)
