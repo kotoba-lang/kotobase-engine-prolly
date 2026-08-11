@@ -38,7 +38,9 @@ the full tree. A fresh writer changes a persisted 2,001-Datom/48-block snapshot
 with 11 block requests, and the same manifest-only reopen/mixed retract+assert/
 CAS/second-reopen flow passes against a real Miniflare `R2Bucket` with 4,001
 seed Datoms. Metadata-chain read amplification remains an explicit qualification
-blocker; a persistent metadata index is the next step.
+blocker. The required persistent request/history/epoch/transaction-coordinate
+index and its migration gates are specified in
+[`docs/metadata-coordinate-index-v1.md`](docs/metadata-coordinate-index-v1.md).
 
 Dependencies are fixed to published Git commit SHAs. West registration should
 advance only to reviewed revisions; generated manifests are not edited with
