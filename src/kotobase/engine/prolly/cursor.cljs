@@ -65,13 +65,39 @@
                   (dissoc coordinates k)))))
           {} history))
 
-(defn- decode-row [index triple coordinates]
+(defn- decode-row [index triple]
   (let [{:keys [s p o]} (zipmap (index-order index) triple)
         row {:e (prolly/decode-component s)
              :a (prolly/decode-component p)
              :v (prolly/decode-component o)
              :added true}]
-    (assoc row :t (get coordinates (canonical/logical-datom-key row)))))
+    row))
+
+(defn- coordinate-key [blind-fn row]
+  (-> (blind-fn
+       (canonical/canonical-string
+        ["kotobase.datom-coordinate/v1" (canonical/logical-datom-key row)]))
+      (.then #(str "t/" %))))
+
+(defn- indexed-coordinate
+  [async-get-fn blind-fn decrypt-fn metadata-root row]
+  (-> (coordinate-key blind-fn row)
+      (.then
+       (fn [key]
+         (-> (tree/scan-prefix-async async-get-fn metadata-root key)
+             (.then
+              (fn [entries]
+                (some (fn [[entry-key ciphertext]]
+                        (when (= key entry-key) ciphertext))
+                      entries))))))
+      (.then (fn [ciphertext]
+               (when-not ciphertext
+                 (throw (ex-info "transaction coordinate is missing"
+                                 {:type :kotobase.engine/missing-coordinate
+                                  :datom (canonical/logical-datom-key row)})))
+               (decrypt-fn ciphertext)))
+      (.then value/decode-value)
+      (.then #(assoc row :t %))))
 
 (defn- matches? [[pe pa pv] {:keys [e a v]}]
   (and (or (nil? pe) (= pe e))
@@ -79,13 +105,13 @@
        (or (nil? pv) (= pv v))))
 
 (defn scan
-  [async-get-fn blind-fn decrypt-fn snapshot-cid history basis-t pattern
+  [async-get-fn blind-fn decrypt-fn snapshot-cid history metadata-root basis-t pattern
    {:keys [limit]}]
   (if (nil? snapshot-cid)
     (js/Promise.resolve [])
     (let [encoded (mapv #(when (some? %) (prolly/encode-component %)) pattern)
           [index components] (plan encoded)
-          coordinates (live-coordinates history basis-t)]
+          coordinates (when history (live-coordinates history basis-t))]
       (-> (checked-node async-get-fn snapshot-cid)
           (.then
            (fn [snapshot]
@@ -105,11 +131,18 @@
                 (-> (decrypt-fn ciphertext)
                     (.then value/decode-value)))
               entries)))
-          (.then
+         (.then
            (fn [triples]
-             (cond->> (->> triples
-                           (map #(decode-row index % coordinates))
-                           (filter #(matches? pattern %)))
-               true canonical/canonical-datoms
-               limit (take limit)
-               true vec)))))))
+             (let [ordered (->> triples
+                                (map #(decode-row index %))
+                                (filter #(matches? pattern %))
+                                canonical/canonical-datoms)
+                   rows (vec (if limit (take limit ordered) ordered))]
+               (if metadata-root
+                 (pmap-async #(indexed-coordinate async-get-fn blind-fn
+                                                   decrypt-fn metadata-root %)
+                             rows)
+                 (js/Promise.resolve
+                  (mapv #(assoc % :t (get coordinates
+                                          (canonical/logical-datom-key %)))
+                        rows))))))))))

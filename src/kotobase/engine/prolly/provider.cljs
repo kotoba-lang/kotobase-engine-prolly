@@ -2,7 +2,8 @@
   "ClojureScript/R2 coordinator. Blocks are constructed into a synchronous
   local batch, uploaded durably, and only then exposed by CAS. Reads and cold
   writes use direct asynchronous, CID-checked block fetches."
-  (:require [kotobase.engine.contract :as engine]
+  (:require [ipld.core :as ipld]
+            [kotobase.engine.contract :as engine]
             [kotobase.engine.prolly :as prolly]
             [kotobase.engine.prolly.cursor :as cursor]
             [kotobase.storage.core :as storage]))
@@ -50,9 +51,9 @@
                          (when bytes (swap! cache assoc cid bytes))
                          bytes)))))
         scan-snapshot-fn
-        (fn [snapshot-root history basis-t pattern opts]
+        (fn [snapshot-root history metadata-root basis-t pattern opts]
           (cursor/scan async-get-fn (:blind-fn crypto) (:decrypt-fn crypto)
-                       snapshot-root history basis-t pattern opts))
+                       snapshot-root history metadata-root basis-t pattern opts))
         eng (prolly/prolly-engine
              (merge {:put! put! :get-fn get-fn
                      :commit-get-fn commit-get-fn
@@ -76,6 +77,19 @@
                  (reset! pending {})
                  result)))))
 
+(defn- prefetch-metadata! [cache async-get-fn head]
+  (letfn [(step [cid]
+            (if-not cid
+              (js/Promise.resolve nil)
+              (-> (async-get-fn cid)
+                  (.then (fn [bytes]
+                           (swap! cache assoc cid bytes)
+                           (let [node (ipld/decode bytes)
+                                 previous (some-> (get node "previous")
+                                                  ipld/link-cid)]
+                             (step previous)))))))]
+    (step head)))
+
 (defn restore-head [eng backend ref-name]
   (storage/validate-backend! backend)
   (-> (storage/-read-ref backend ref-name)
@@ -86,7 +100,19 @@
                    (-> (async-get-fn cid)
                        (.then (fn [bytes]
                                 (swap! cache assoc cid bytes)
-                                (engine/restore-state eng cid {:lazy? true})))))
+                                (let [node (ipld/decode bytes)
+                                      metadata-head
+                                      (some-> (get node "metadata-head")
+                                              ipld/link-cid)
+                                      format-version (get node "format-version")]
+                                  (-> (if (= 2 format-version)
+                                        (prefetch-metadata! cache async-get-fn
+                                                            metadata-head)
+                                        (js/Promise.resolve nil))
+                                      (.then
+                                       (fn [_]
+                                         (engine/restore-state eng cid
+                                                               {:lazy? true})))))))))
                  nil)))))
 
 (defn transact-and-publish!
