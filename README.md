@@ -14,10 +14,12 @@ real key deletion rather than tombstones: a deleted boundary re-chunks its leaf
 and successor, while mixed additions/removals rebuild internal levels once.
 The result is CID-identical to a full rebuild of the same logical graph.
 
-The engine writes a small content-addressed manifest above each Arrangement
-snapshot. The manifest persists transaction history, idempotency records and
-epoch-to-snapshot roots, so `restore-state` works from object storage without
-the process-local state.
+Manifest format v2 writes a bounded content-addressed node above each
+Arrangement snapshot. It contains only fixed-size roots and public routing
+metadata. Transaction history and idempotency deltas live in CID-linked
+metadata segments whose payloads always cross the injected
+`encrypt-fn`/`decrypt-fn` boundary. Readers retain format-v1 compatibility, but
+new writers never copy cumulative EDN maps or plaintext facts into the root.
 
 `kotobase.engine.prolly.provider` adapts any JVM `kotobase-storage` backend to
 the engine and publishes a manifest only through `IRefStore` compare-and-set.
@@ -26,15 +28,17 @@ winner. S3-compatible providers must still pass `kotobase-storage`'s own CAS,
 content-verification and concurrency suites before qualification.
 
 The ClojureScript coordinator batches synchronously generated immutable blocks,
-awaits the provider upload, and then performs CAS. Reopen fetches only the
-manifest; reads use a direct async, range-pruned Prolly cursor with bounded
+awaits the provider upload, and then performs CAS. Reopen fetches the bounded
+manifest and its sealed metadata chain; reads use a direct async, range-pruned
+Prolly cursor with bounded
 concurrency. The regression harness reads one entity from a 2,001-Datom,
-40-block snapshot using 4 block requests total. Cold mutation now fetches the
+40-block snapshot using 4 data-block requests total. Cold mutation now fetches the
 internal summary path plus only the affected leaf windows rather than warming
 the full tree. A fresh writer changes a persisted 2,001-Datom/48-block snapshot
 with 11 block requests, and the same manifest-only reopen/mixed retract+assert/
 CAS/second-reopen flow passes against a real Miniflare `R2Bucket` with 4,001
-seed Datoms.
+seed Datoms. Metadata-chain read amplification remains an explicit qualification
+blocker; a persistent metadata index is the next step.
 
 Dependencies are fixed to published Git commit SHAs. West registration should
 advance only to reviewed revisions; generated manifests are not edited with

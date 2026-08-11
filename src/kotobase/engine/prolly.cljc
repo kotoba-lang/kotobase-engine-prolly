@@ -7,9 +7,10 @@
             [kotobase.engine.canonical :as canonical]
             [kotobase.engine.completion :as completion]
             [kotobase.engine.contract :as contract]
+            [kotobase.engine.metadata :as metadata]
             [kotobase.engine.profile :as profile]))
 
-(def engine-format-version 1)
+(def engine-format-version 2)
 
 (def prolly-profile
   (-> profile/prolly
@@ -19,8 +20,8 @@
               :incremental-assertions :incremental-retractions
               :mixed-delta-commit)))
 
-(defn- digest [engine x]
-  ((:digest-fn engine) (canonical/canonical-string x)))
+(defn- digest [engine canonical-string]
+  ((:digest-fn engine) canonical-string))
 
 (defn encode-component [x]
   (canonical/canonical-string x))
@@ -71,29 +72,45 @@
        (or (nil? pa) (= pa a))
        (or (nil? pv) (= pv v))))
 
-(defn- manifest-node [state snapshot-root current-request]
+(defn- manifest-node [state snapshot-root metadata-head]
   {"engine" "kotobase-engine-prolly"
    "format-version" engine-format-version
    "database-id" (:database-id state)
    "basis-t" (:basis-t state)
    "snapshot" (some-> snapshot-root ipld/link)
-   "history-edn" (pr-str (:history state))
-   "requests-edn" (pr-str (:requests state))
-   "snapshots-edn" (pr-str (:snapshots state))
-   "manifests-edn" (pr-str (:manifests state))
-   "current-request-edn" (pr-str current-request)})
+   "metadata-head" (some-> metadata-head ipld/link)
+   "previous-manifest" (some-> (:physical-root state) ipld/link)})
 
 (defn- read-edn-field [node field]
   (edn/read-string (get node field)))
 
 (defn- validate-manifest [node physical-root]
   (when-not (and (= "kotobase-engine-prolly" (get node "engine"))
-                 (= engine-format-version (get node "format-version")))
+                 (contains? #{1 engine-format-version}
+                            (get node "format-version")))
     (throw (ex-info "unsupported Prolly engine manifest"
                     {:type :kotobase.engine/unsupported-manifest
                      :physical-root physical-root
                      :format (get node "format-version")})))
   node)
+
+(defn- restored-metadata [segments physical-root]
+  (let [deltas (mapv :delta segments)
+        roots (reduce (fn [m {:keys [epoch previous-physical-root]}]
+                        (cond-> m
+                          previous-physical-root
+                          (assoc (dec epoch) previous-physical-root)))
+                      {(or (:epoch (peek deltas)) 0) physical-root}
+                      deltas)]
+    {:history (into [] (mapcat :history) deltas)
+     :snapshots (into {} (map (juxt :epoch :snapshot-root)) deltas)
+     :manifests roots
+     :requests
+     (into {}
+           (map (fn [{:keys [epoch request]}]
+                  [(:request-id request)
+                   (assoc request :epoch epoch :physical-root (get roots epoch))]))
+           deltas)}))
 
 (defrecord ProllyEngine [put! get-fn commit-get-fn blind-fn encrypt-fn
                          decrypt-fn digest-fn scan-snapshot-fn]
@@ -107,41 +124,65 @@
      :history []
      :requests {}
      :snapshots {}
-     :manifests {}})
+     :manifests {}
+     :metadata-head nil})
 
   (-restore-state [_ physical-root opts]
     (let [node (validate-manifest (ipld/decode (get-fn physical-root))
-                                  physical-root)
-          database-id (get node "database-id")
-          basis-t (get node "basis-t")
-          snapshot-root (some-> (get node "snapshot") ipld/link-cid)
-          history (read-edn-field node "history-edn")
-          prior-requests (read-edn-field node "requests-edn")
-          snapshots (assoc (read-edn-field node "snapshots-edn")
-                           basis-t snapshot-root)
-          manifests (assoc (read-edn-field node "manifests-edn")
-                           basis-t physical-root)
-          current-request (read-edn-field node "current-request-edn")
-          requests (cond-> prior-requests
-                     current-request
-                     (assoc (:request-id current-request)
-                            (assoc current-request :physical-root physical-root)))
-          finish (fn [db]
-                   {:database-id database-id :basis-t basis-t :db db
-                    :history history :requests requests :snapshots snapshots
-                    :manifests manifests :physical-root physical-root})]
-      (if (:lazy? opts)
-        (finish nil)
-        (completion/then-result
-         (arrangement/restore get-fn snapshot-root decrypt-fn)
-         finish))))
+                                  physical-root)]
+      (if (= 1 (get node "format-version"))
+        (let [database-id (get node "database-id")
+              basis-t (get node "basis-t")
+              snapshot-root (some-> (get node "snapshot") ipld/link-cid)
+              history (read-edn-field node "history-edn")
+              prior-requests (read-edn-field node "requests-edn")
+              snapshots (assoc (read-edn-field node "snapshots-edn")
+                               basis-t snapshot-root)
+              manifests (assoc (read-edn-field node "manifests-edn")
+                               basis-t physical-root)
+              current-request (read-edn-field node "current-request-edn")
+              requests (cond-> prior-requests
+                         current-request
+                         (assoc (:request-id current-request)
+                                (assoc current-request
+                                       :physical-root physical-root)))
+              finish (fn [db]
+                       {:database-id database-id :basis-t basis-t :db db
+                        :history history :requests requests
+                        :snapshots snapshots :manifests manifests
+                        :metadata-head nil :physical-root physical-root})]
+          (if (:lazy? opts)
+            (finish nil)
+            (completion/then-result
+             (arrangement/restore get-fn snapshot-root decrypt-fn)
+             finish)))
+        (let [database-id (get node "database-id")
+              basis-t (get node "basis-t")
+              snapshot-root (some-> (get node "snapshot") ipld/link-cid)
+              metadata-head (some-> (get node "metadata-head") ipld/link-cid)]
+          (completion/then-result
+           (metadata/restore-chain get-fn decrypt-fn metadata-head)
+           (fn [segments]
+             (let [{:keys [history requests snapshots manifests]}
+                   (restored-metadata segments physical-root)
+                   finish (fn [db]
+                            {:database-id database-id :basis-t basis-t :db db
+                             :history history :requests requests
+                             :snapshots snapshots :manifests manifests
+                             :metadata-head metadata-head
+                             :physical-root physical-root})]
+               (if (:lazy? opts)
+                 (finish nil)
+                 (completion/then-result
+                  (arrangement/restore get-fn snapshot-root decrypt-fn)
+                  finish)))))))))
 
   (-transact [this state {:keys [database-id request-id tx-data]}]
     (when-not (= database-id (:database-id state))
       (throw (ex-info "transaction database does not match state"
                       {:type :kotobase.engine/database-mismatch})))
     (let [tx (canonical/normalize-tx tx-data)
-          tx-root (digest this tx)]
+          tx-root (digest this (canonical/transaction-string tx))]
       (if-let [prior (get-in state [:requests request-id])]
         (if (= tx-root (:tx-root prior))
           {:state state
@@ -187,20 +228,31 @@
                                   (assoc :basis-t t :db db)
                                   (update :history into appended)
                                   (assoc-in [:snapshots t] snapshot-root))
-                   current-request {:request-id request-id :tx-root tx-root :epoch t}
-                   physical-root (ipld/put-node!
-                                  put! (manifest-node next-state snapshot-root
-                                                      current-request))
-                   request-record (assoc current-request :physical-root physical-root)
-                   final-state (-> next-state
-                                   (assoc :physical-root physical-root)
-                                   (assoc-in [:manifests t] physical-root)
-                                   (assoc-in [:requests request-id] request-record))]
-               {:state final-state
-                :receipt {:database-id database-id :epoch t
-                          :request-id request-id :tx-root tx-root
-                          :physical-root physical-root :engine prolly-profile
-                          :status :committed}})))))))
+                   current-request {:request-id request-id :tx-root tx-root}]
+               (completion/then-result
+                (metadata/persist-segment!
+                 put! encrypt-fn (:metadata-head state)
+                 {:epoch t :history appended :request current-request
+                  :snapshot-root snapshot-root
+                  :previous-physical-root (:physical-root state)})
+                (fn [metadata-head]
+                  (let [physical-root
+                        (ipld/put-node!
+                         put! (manifest-node next-state snapshot-root metadata-head))
+                        request-record (assoc current-request :epoch t
+                                              :physical-root physical-root)
+                        final-state (-> next-state
+                                        (assoc :metadata-head metadata-head
+                                               :physical-root physical-root)
+                                        (assoc-in [:manifests t] physical-root)
+                                        (assoc-in [:requests request-id]
+                                                  request-record))]
+                    {:state final-state
+                     :receipt {:database-id database-id :epoch t
+                               :request-id request-id :tx-root tx-root
+                               :physical-root physical-root
+                               :engine prolly-profile
+                               :status :committed}}))))))))))
 
   (-open-snapshot [_ state selector]
     (let [basis (:basis-t state)
@@ -256,7 +308,7 @@
        {:database-id database-id
         :epoch basis-t
         :logical-checkpoint-root
-        (digest this (canonical/checkpoint-datoms rows))
+        (digest this (canonical/checkpoint-string rows))
         :physical-root physical-root
         :engine prolly-profile}))))
 

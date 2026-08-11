@@ -1,10 +1,15 @@
 (ns kotobase.engine.prolly-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [arrangement.core :as arrangement]
+            [ipld.core :as ipld]
             [kotobase.engine.conformance :as conformance]
             [kotobase.engine.contract :as engine]
             [kotobase.engine.memory :as memory]
             [kotobase.engine.prolly :as prolly]))
+
+(defn- reverse-bytes [payload]
+  (byte-array (reverse (seq payload))))
 
 (defn- fixture []
   (let [blocks (atom {})]
@@ -42,6 +47,40 @@
       (is (= :replayed
              (get-in (engine/transact engine restored tx)
                      [:receipt :status]))))))
+
+(deftest manifest-v2-is-bounded-and-carries-no-plaintext-metadata
+  (let [blocks (atom {})
+        eng (prolly/prolly-engine
+             {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+              :get-fn #(get @blocks %)
+              :blind-fn #(str "blind:" %)
+              :encrypt-fn reverse-bytes :decrypt-fn reverse-bytes
+              :digest-fn #(str "digest:" (hash %))})
+        transact-one
+        (fn [state n]
+          (:state
+           (engine/transact
+            eng state
+            {:database-id "bounded/db" :request-id (str "private-request-" n)
+             :tx-data [[:db/add (str "entity-" n) :private/value
+                        (str "secret-value-" n)]]})))
+        s1 (transact-one (engine/empty-state eng "bounded/db") 1)
+        s2 (transact-one s1 2)
+        s20 (reduce transact-one s2 (range 3 21))
+        root2-bytes (get @blocks (:physical-root s2))
+        root20-bytes (get @blocks (:physical-root s20))
+        root20 (ipld/decode root20-bytes)
+        metadata-node (ipld/decode (get @blocks (:metadata-head s20)))]
+    (is (= 2 (get root20 "format-version")))
+    (is (= #{"engine" "format-version" "database-id" "basis-t" "snapshot"
+             "metadata-head" "previous-manifest"}
+           (set (keys root20))))
+    (is (<= (count root20-bytes) (+ 16 (count root2-bytes)))
+        "root manifest size is independent of transaction history")
+    (is (= #{"format" "payload" "previous"} (set (keys metadata-node))))
+    (is (not-any? #(str/includes? (pr-str root20) %)
+                  ["private-request" "secret-value" "history-edn"
+                   "requests-edn" "snapshots-edn" "manifests-edn"]))))
 
 (deftest differential-equivalence-with-memory-oracle
   (let [digest-fn #(str "digest:" (hash %))
