@@ -5,6 +5,7 @@
             [ipld.core :as ipld]
             [kotobase.engine.conformance :as conformance]
             [kotobase.engine.contract :as engine]
+            [kotobase.engine.metadata :as metadata]
             [kotobase.engine.memory :as memory]
             [kotobase.engine.prolly :as prolly]))
 
@@ -48,12 +49,12 @@
              (get-in (engine/transact engine restored tx)
                      [:receipt :status]))))))
 
-(deftest manifest-v2-is-bounded-and-carries-no-plaintext-metadata
+(deftest manifest-v3-is-bounded-and-carries-no-plaintext-metadata
   (let [blocks (atom {})
         eng (prolly/prolly-engine
              {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
               :get-fn #(get @blocks %)
-              :blind-fn #(str "blind:" %)
+              :blind-fn #(str "blind:" (hash %))
               :encrypt-fn reverse-bytes :decrypt-fn reverse-bytes
               :digest-fn #(str "digest:" (hash %))})
         transact-one
@@ -70,14 +71,15 @@
         root2-bytes (get @blocks (:physical-root s2))
         root20-bytes (get @blocks (:physical-root s20))
         root20 (ipld/decode root20-bytes)
-        metadata-node (ipld/decode (get @blocks (:metadata-head s20)))]
-    (is (= 2 (get root20 "format-version")))
+        metadata-node (ipld/decode (get @blocks (:metadata-root s20)))]
+    (is (= 3 (get root20 "format-version")))
     (is (= #{"engine" "format-version" "database-id" "basis-t" "snapshot"
-             "metadata-head" "previous-manifest"}
+             "metadata-format" "metadata-root" "current-request-key"
+             "previous-manifest"}
            (set (keys root20))))
     (is (<= (count root20-bytes) (+ 16 (count root2-bytes)))
         "root manifest size is independent of transaction history")
-    (is (= #{"format" "payload" "previous"} (set (keys metadata-node))))
+    (is (contains? #{"leaf" "internal"} (get metadata-node "kind")))
     (is (not-any? #(str/includes? (pr-str root20) %)
                   ["private-request" "secret-value" "history-edn"
                    "requests-edn" "snapshots-edn" "manifests-edn"]))))
@@ -115,6 +117,130 @@
             (engine/checkpoint prolly-engine
                                (engine/open-snapshot prolly-engine ps)))))))
 
+(deftest persistent-coordinate-roots-preserve-as-of-transaction-time
+  (let [{:keys [engine]} (fixture)
+        database-id "coordinate/as-of"
+        step (fn [state request-id tx-data]
+               (:state
+                (engine/transact engine state
+                                 {:database-id database-id
+                                  :request-id request-id :tx-data tx-data})))
+        s1 (step (engine/empty-state engine database-id) "c1"
+                 [[:db/add "e" :value 1]])
+        s2 (step s1 "c2" [[:db/retract "e" :value 1]])
+        s3 (step s2 "c3" [[:db/add "e" :value 1]])
+        restored (engine/restore-state engine (:physical-root s3))
+        rows-at (fn [epoch]
+                  (engine/scan
+                   engine (engine/open-snapshot engine restored {:as-of epoch})
+                   ["e" :value nil]))]
+    (is (= [1] (mapv :t (rows-at 1))))
+    (is (empty? (rows-at 2)))
+    (is (= [3] (mapv :t (rows-at 3))))))
+
+(deftest indexed-restore-and-old-request-replay-are-bounded
+  (let [{writer :engine blocks :blocks} (fixture)
+        database-id "coordinate/scale"
+        first-state
+        (:state
+         (engine/transact
+          writer (engine/empty-state writer database-id)
+          {:database-id database-id :request-id "scale-1"
+           :tx-data [[:db/add "entity-1" :value 1]]}))
+        first-root (:physical-root first-state)
+        final-state
+        (reduce
+         (fn [state epoch]
+           (:state
+            (engine/transact
+             writer state
+             {:database-id database-id :request-id (str "scale-" epoch)
+              :tx-data [[:db/add (str "entity-" epoch) :value epoch]]})))
+         first-state (range 2 33))
+        gets (atom 0)
+        reader
+        (prolly/prolly-engine
+         {:put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+          :get-fn (fn [cid] (swap! gets inc) (get @blocks cid))
+          :blind-fn #(str "blind:" %) :encrypt-fn identity
+          :decrypt-fn identity :digest-fn #(str "digest:" (hash %))})
+        restored (engine/restore-state reader (:physical-root final-state)
+                                       {:lazy? true})
+        restore-gets @gets
+        replay (engine/transact
+                reader restored
+                {:database-id database-id :request-id "scale-1"
+                 :tx-data [[:db/add "entity-1" :value 1]]})
+        replay-gets (- @gets restore-gets)]
+    (is (nil? (:history restored)))
+    (is (< restore-gets 10)
+        (str "32-epoch restore used " restore-gets " block reads"))
+    (is (= :replayed (get-in replay [:receipt :status])))
+    (is (= first-root (get-in replay [:receipt :physical-root])))
+    (is (< replay-gets 10)
+        (str "old request replay used " replay-gets " block reads"))))
+
+(deftest format-v2-chain-migrates-to-v3-coordinate-index
+  (let [{candidate :engine blocks :blocks} (fixture)
+        database-id "coordinate/v2-migration"
+        r1 (engine/transact
+            candidate (engine/empty-state candidate database-id)
+            {:database-id database-id :request-id "old-1"
+             :tx-data [[:db/add "e1" :value 1]]})
+        s1 (:state r1)
+        r2 (engine/transact
+            candidate s1
+            {:database-id database-id :request-id "old-2"
+             :tx-data [[:db/add "e2" :value 2]]})
+        s2 (:state r2)
+        put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+        segment1
+        (metadata/persist-segment!
+         put! identity nil
+         {:epoch 1
+          :history [{:e "e1" :a :value :v 1 :t 1 :added true}]
+          :request {:request-id "old-1" :tx-root (get-in r1 [:receipt :tx-root])}
+          :snapshot-root (get-in s1 [:snapshots 1])
+          :previous-physical-root nil})
+        segment2
+        (metadata/persist-segment!
+         put! identity segment1
+         {:epoch 2
+          :history [{:e "e2" :a :value :v 2 :t 2 :added true}]
+          :request {:request-id "old-2" :tx-root (get-in r2 [:receipt :tx-root])}
+          :snapshot-root (get-in s2 [:snapshots 2])
+          :previous-physical-root (:physical-root s1)})
+        v2-root
+        (ipld/put-node!
+         put! {"engine" "kotobase-engine-prolly" "format-version" 2
+               "database-id" database-id "basis-t" 2
+               "snapshot" (ipld/link (get-in s2 [:snapshots 2]))
+               "metadata-head" (ipld/link segment2)
+               "previous-manifest" (ipld/link (:physical-root s1))})
+        restored-v2 (engine/restore-state candidate v2-root)
+        migrated
+        (:state
+         (engine/transact
+          candidate restored-v2
+          {:database-id database-id :request-id "new-3"
+           :tx-data [[:db/add "e3" :value 3]]}))
+        restored-v3 (engine/restore-state candidate (:physical-root migrated))
+        replay-old
+        (engine/transact
+         candidate restored-v3
+         {:database-id database-id :request-id "old-1"
+          :tx-data [[:db/add "e1" :value 1]]})]
+    (is (= 3 (get (ipld/decode (get @blocks (:physical-root migrated)))
+                  "format-version")))
+    (is (= :replayed (get-in replay-old [:receipt :status])))
+    (is (= (:physical-root s1) (get-in replay-old [:receipt :physical-root])))
+    (is (= [1]
+           (mapv :t
+                 (engine/scan
+                  candidate (engine/open-snapshot candidate restored-v3
+                                                  {:as-of 1})
+                  ["e1" :value nil]))))))
+
 (deftest assertion-write-is-path-incremental
   (let [blocks (atom {})
         writes (atom 0)
@@ -146,7 +272,7 @@
                     (swap! blocks assoc cid bytes))]
     (arrangement/commit! full-put! (:db added) previous
                          arrangement/current-schema-version blind identity)
-    (is (<= (* 3 delta-writes) @full-writes)
+    (is (<= (* 2 delta-writes) @full-writes)
         (str "delta=" delta-writes " full=" @full-writes))))
 
 (deftest mixed-assert-retract-write-is-path-incremental

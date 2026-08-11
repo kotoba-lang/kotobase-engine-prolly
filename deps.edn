@@ -1,6 +1,6 @@
 {:paths ["src"]
  :deps {io.github.kotoba-lang/kotobase-engine-contract
-        {:git/sha "16012e26b393979ecbcade006096c100fc80fb68"}
+        {:git/sha "c30ace74bc6d7441a052e01e2b6a8a784866370e"}
         io.github.kotoba-lang/arrangement
         {:git/sha "1a3d835b58d5d92392fdafcb8ee82a60c7f18db7"}
         io.github.kotoba-lang/prolly-tree

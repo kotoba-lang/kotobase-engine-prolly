@@ -6,7 +6,7 @@ value carries `[a b o]`, while the engine returns Datoms with the transaction
 coordinate `t`; normal scans reconstruct that coordinate from the entire
 history vector.
 
-The next manifest format therefore commits a second persistent Prolly root
+Manifest format v3 therefore commits a second persistent Prolly root
 with four key spaces:
 
 | Prefix | Key | Value | Access |
@@ -26,8 +26,8 @@ coordinate; retractions remove it. A cursor batches coordinate lookups only for
 rows returned by the selected covering-index range. A normal point read must
 never scan `h/`; explicit history is allowed to do so.
 
-Migration reads format v1/v2, builds the four namespaces on the next write, and
-publishes format v3. Qualification requires:
+Migration reads format v1/v2, replays historical coordinate roots on the next
+write, and publishes format v3. Qualification gates implemented by this repo:
 
 - 32-epoch cold restore with fewer than 10 metadata block reads;
 - replay of the oldest request with fewer than 10 metadata block reads;

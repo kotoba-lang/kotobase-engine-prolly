@@ -51,9 +51,9 @@
                          (when bytes (swap! cache assoc cid bytes))
                          bytes)))))
         scan-snapshot-fn
-        (fn [snapshot-root history basis-t pattern opts]
+        (fn [snapshot-root history metadata-root basis-t pattern opts]
           (cursor/scan async-get-fn (:blind-fn crypto) (:decrypt-fn crypto)
-                       snapshot-root history basis-t pattern opts))
+                       snapshot-root history metadata-root basis-t pattern opts))
         eng (prolly/prolly-engine
              (merge {:put! put! :get-fn get-fn
                      :commit-get-fn commit-get-fn
@@ -103,9 +103,12 @@
                                 (let [node (ipld/decode bytes)
                                       metadata-head
                                       (some-> (get node "metadata-head")
-                                              ipld/link-cid)]
-                                  (-> (prefetch-metadata! cache async-get-fn
-                                                          metadata-head)
+                                              ipld/link-cid)
+                                      format-version (get node "format-version")]
+                                  (-> (if (= 2 format-version)
+                                        (prefetch-metadata! cache async-get-fn
+                                                            metadata-head)
+                                        (js/Promise.resolve nil))
                                       (.then
                                        (fn [_]
                                          (engine/restore-state eng cid

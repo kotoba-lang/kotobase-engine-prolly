@@ -4,13 +4,16 @@
             [arrangement.core :as arrangement]
             [arrangement.query :as query]
             [ipld.core :as ipld]
+            [ipld.value :as value]
             [kotobase.engine.canonical :as canonical]
             [kotobase.engine.completion :as completion]
             [kotobase.engine.contract :as contract]
             [kotobase.engine.metadata :as metadata]
-            [kotobase.engine.profile :as profile]))
+            [kotobase.engine.profile :as profile]
+            [prolly-tree.core :as tree]))
 
-(def engine-format-version 2)
+(def engine-format-version 3)
+(def metadata-index-format "kotobase.engine-metadata-index/v1")
 
 (def prolly-profile
   (-> profile/prolly
@@ -18,7 +21,8 @@
       (update :engine/capabilities disj :structural-diff)
       (update :engine/capabilities conj :typed-edn :durable-manifest
               :incremental-assertions :incremental-retractions
-              :mixed-delta-commit)))
+              :mixed-delta-commit :persistent-metadata-index
+              :transaction-coordinate-index :lazy-history)))
 
 (defn- digest [engine canonical-string]
   ((:digest-fn engine) canonical-string))
@@ -56,14 +60,18 @@
                      (dissoc coordinates k))))
                {})))
 
+(defn- visible-values [db pattern]
+  (let [encoded-pattern (mapv #(when (some? %) (encode-component %)) pattern)]
+    (->> (query/query db encoded-pattern (constantly true))
+         (map quad->logical)
+         canonical/canonical-datoms)))
+
 (defn- visible-rows
   ([db history basis-t]
    (visible-rows db history basis-t [nil nil nil]))
   ([db history basis-t pattern]
-   (let [encoded-pattern (mapv #(when (some? %) (encode-component %)) pattern)
-         coordinates (live-transaction-coordinates history basis-t)]
-     (->> (query/query db encoded-pattern (constantly true))
-       (map quad->logical)
+   (let [coordinates (live-transaction-coordinates history basis-t)]
+     (->> (visible-values db pattern)
        (map #(assoc % :t (get coordinates (canonical/logical-datom-key %))))
        canonical/canonical-datoms))))
 
@@ -72,13 +80,15 @@
        (or (nil? pa) (= pa a))
        (or (nil? pv) (= pv v))))
 
-(defn- manifest-node [state snapshot-root metadata-head]
+(defn- manifest-node [state snapshot-root metadata-root current-request-key]
   {"engine" "kotobase-engine-prolly"
    "format-version" engine-format-version
    "database-id" (:database-id state)
    "basis-t" (:basis-t state)
    "snapshot" (some-> snapshot-root ipld/link)
-   "metadata-head" (some-> metadata-head ipld/link)
+   "metadata-format" metadata-index-format
+   "metadata-root" (some-> metadata-root ipld/link)
+   "current-request-key" current-request-key
    "previous-manifest" (some-> (:physical-root state) ipld/link)})
 
 (defn- read-edn-field [node field]
@@ -86,7 +96,7 @@
 
 (defn- validate-manifest [node physical-root]
   (when-not (and (= "kotobase-engine-prolly" (get node "engine"))
-                 (contains? #{1 engine-format-version}
+                 (contains? #{1 2 engine-format-version}
                             (get node "format-version")))
     (throw (ex-info "unsupported Prolly engine manifest"
                     {:type :kotobase.engine/unsupported-manifest
@@ -112,6 +122,245 @@
                    (assoc request :epoch epoch :physical-root (get roots epoch))]))
            deltas)}))
 
+(defn- padded-epoch [epoch]
+  (let [digits (str epoch)]
+    (str (apply str (repeat (max 0 (- 20 (count digits))) "0")) digits)))
+
+(defn- epoch-key [epoch] (str "e/" (padded-epoch epoch)))
+(defn- history-key [epoch] (str "h/" (padded-epoch epoch)))
+
+(defn- keyed-index-key [blind-fn prefix domain value]
+  (completion/then-result
+   (blind-fn (canonical/canonical-string [domain value]))
+   (fn [token]
+     (when-not (contract/nonblank-string? token)
+       (throw (ex-info "blind-fn returned an invalid metadata token"
+                       {:type :kotobase.engine/invalid-metadata-key})))
+     (str prefix token))))
+
+(defn- request-key [blind-fn request-id]
+  (keyed-index-key blind-fn "r/" "kotobase.request-id/v1" request-id))
+
+(defn- coordinate-key [blind-fn datom]
+  (keyed-index-key blind-fn "t/" "kotobase.datom-coordinate/v1"
+                   (canonical/logical-datom-key datom)))
+
+#_{:clj-kondo/ignore [:unused-private-var]}
+(defn- tree-get [get-fn cid] (get-fn cid))
+
+#_{:clj-kondo/ignore [:unused-private-var]}
+(defn- tree-get-completion [get-fn cid] (get-fn cid))
+
+(defn- index-lookup [get-fn root key]
+  #?(:clj (tree/lookup #(tree-get get-fn %) root key)
+     :cljs (-> (tree/scan-prefix-async
+                #(tree-get-completion get-fn %) root key)
+               (.then (fn [entries]
+                        (some (fn [[entry-key entry-value]]
+                                (when (= key entry-key) entry-value))
+                              entries))))))
+
+(defn- index-insert-many [put! get-fn root pairs]
+  #?(:clj (tree/insert-many put! #(tree-get get-fn %) root pairs)
+     :cljs (tree/insert-many-async put! #(tree-get-completion get-fn %)
+                                   root pairs)))
+
+(defn- index-mutate-many [put! get-fn root additions removals]
+  #?(:clj (tree/mutate-many put! #(tree-get get-fn %) root
+                            additions removals)
+     :cljs (tree/mutate-many-async put! #(tree-get-completion get-fn %)
+                                   root additions removals)))
+
+(defn- seal-entry [encrypt-fn entry]
+  (completion/then-result (encrypt-fn (value/encode-value entry)) identity))
+
+(defn- open-entry [decrypt-fn ciphertext]
+  (when ciphertext
+    (completion/then-result (decrypt-fn ciphertext) value/decode-value)))
+
+(defn- encrypted-pair [encrypt-fn key entry]
+  (completion/then-result (seal-entry encrypt-fn entry) #(vector key %)))
+
+(defn- append-completion [result completion]
+  (completion/then-result
+   result
+   (fn [values]
+     (completion/then-result completion #(conj values %)))))
+
+(defn- indexed-request-by-key [get-fn decrypt-fn metadata-root key]
+  (completion/then-result
+   (index-lookup get-fn metadata-root key)
+   #(open-entry decrypt-fn %)))
+
+(defn- indexed-request [get-fn decrypt-fn blind-fn state request-id]
+  (completion/then-result
+   (request-key blind-fn request-id)
+   (fn [key]
+     (completion/then-result
+      (indexed-request-by-key get-fn decrypt-fn (:metadata-root state) key)
+      (fn [record]
+        (when record
+          (cond-> record
+            (and (= key (:current-request-key state))
+                 (nil? (:physical-root record)))
+            (assoc :physical-root (:physical-root state)))))))))
+
+(defn- indexed-history [get-fn decrypt-fn metadata-root]
+  (let [entries #?(:clj (tree/scan-prefix #(tree-get get-fn %)
+                                           metadata-root "h/")
+                   :cljs (tree/scan-prefix-async
+                          #(tree-get-completion get-fn %) metadata-root "h/"))]
+    (completion/then-result
+     entries
+     (fn [pairs]
+       (reduce
+        (fn [result [_ ciphertext]]
+          (completion/then-result
+           result
+           (fn [rows]
+             (completion/then-result
+              (open-entry decrypt-fn ciphertext)
+              #(into rows %)))))
+        [] pairs)))))
+
+(defn- indexed-epoch [get-fn metadata-root epoch]
+  (index-lookup get-fn metadata-root (epoch-key epoch)))
+
+(defn- enrich-coordinates
+  [get-fn decrypt-fn blind-fn metadata-root rows]
+  (reduce
+   (fn [result row]
+     (completion/then-result
+      result
+      (fn [out]
+        (completion/then-result
+         (coordinate-key blind-fn row)
+         (fn [key]
+           (completion/then-result
+            (index-lookup get-fn metadata-root key)
+            (fn [ciphertext]
+              (completion/then-result
+               (open-entry decrypt-fn ciphertext)
+               #(conj out (assoc row :t %))))))))))
+   [] rows))
+
+(defn- migration-index-pairs [encrypt-fn blind-fn state]
+  (let [history (or (:history state) [])
+        history-pairs
+        (reduce-kv
+         (fn [result epoch rows]
+           (append-completion result
+                              (encrypted-pair encrypt-fn (history-key epoch)
+                                              rows)))
+         [] (group-by :t history))
+        request-pairs
+        (reduce
+         (fn [result request]
+           (append-completion
+            result
+            (completion/then-result
+             (request-key blind-fn (:request-id request))
+             #(encrypted-pair encrypt-fn % request))))
+         history-pairs (vals (:requests state)))]
+    request-pairs))
+
+(defn- transaction-coordinate-ops [encrypt-fn blind-fn epoch operations]
+  (reduce
+   (fn [result datom]
+     (completion/then-result
+      result
+      (fn [{:keys [additions removals]}]
+        (completion/then-result
+         (coordinate-key blind-fn datom)
+         (fn [key]
+           (if (= :assert (:op datom))
+             (completion/then-result
+              (encrypted-pair encrypt-fn key epoch)
+              #(hash-map :additions (conj additions %)
+                         :removals removals))
+             {:additions additions :removals (conj removals key)}))))))
+   {:additions [] :removals []} operations))
+
+(defn- bootstrap-index!
+  [put! get-fn encrypt-fn blind-fn state]
+  (completion/then-result
+   (migration-index-pairs encrypt-fn blind-fn state)
+   (fn [pairs]
+     (completion/then-result
+      (index-insert-many put! get-fn nil pairs)
+      (fn [initial-root]
+        (reduce
+         (fn [root-completion [epoch datoms]]
+           (completion/then-result
+            root-completion
+            (fn [root]
+              (let [operations
+                    (mapv #(assoc % :op (if (:added %) :assert :retract))
+                          datoms)]
+                (completion/then-result
+                 (transaction-coordinate-ops encrypt-fn blind-fn epoch
+                                             operations)
+                 (fn [{:keys [additions removals]}]
+                   (completion/then-result
+                    (index-mutate-many put! get-fn root additions removals)
+                    (fn [coordinate-root]
+                      (let [snapshot-root (get-in state [:snapshots epoch])
+                            manifest-root (get-in state [:manifests epoch])
+                            epoch-entry
+                            [(epoch-key epoch)
+                             (cond-> {"snapshot" (ipld/link snapshot-root)
+                                      "metadata-root"
+                                      (ipld/link coordinate-root)}
+                               manifest-root
+                               (assoc "manifest" (ipld/link manifest-root)))]]
+                        (index-insert-many put! get-fn coordinate-root
+                                           [epoch-entry]))))))))))
+         initial-root
+         (sort-by first (group-by :t (or (:history state) [])))))))))
+
+(defn- commit-index!
+  [put! get-fn encrypt-fn blind-fn state epoch appended request operations]
+  (completion/then-result
+   (if (:metadata-root state)
+     (:metadata-root state)
+     (bootstrap-index! put! get-fn encrypt-fn blind-fn state))
+   (fn [base-root]
+     (completion/then-result
+      (request-key blind-fn (:request-id request))
+      (fn [current-key]
+        (let [current-pair (encrypted-pair encrypt-fn current-key request)
+              history-pair (encrypted-pair encrypt-fn (history-key epoch)
+                                           appended)
+              previous-pair
+              (when (and (:current-request-key state)
+                         (:current-request state))
+                (encrypted-pair encrypt-fn (:current-request-key state)
+                                (:current-request state)))
+              epoch-pair
+              (when (pos? (:basis-t state))
+                [(epoch-key (:basis-t state))
+                 (cond-> {"snapshot"
+                          (ipld/link (get-in state
+                                           [:snapshots (:basis-t state)]))
+                          "manifest" (ipld/link (:physical-root state))}
+                   base-root (assoc "metadata-root" (ipld/link base-root)))])]
+          (completion/then-result
+           (append-completion (append-completion [] current-pair) history-pair)
+           (fn [pairs]
+             (completion/then-result
+              (if previous-pair (append-completion pairs previous-pair) pairs)
+              (fn [pairs]
+                (completion/then-result
+                 (transaction-coordinate-ops encrypt-fn blind-fn epoch
+                                             operations)
+                 (fn [{:keys [additions removals]}]
+                   (let [additions (cond-> (into pairs additions)
+                                     epoch-pair (conj epoch-pair))]
+                     (completion/then-result
+                      (index-mutate-many put! get-fn base-root additions removals)
+                      (fn [root]
+                        {:root root :current-key current-key})))))))))))))))
+
 (defrecord ProllyEngine [put! get-fn commit-get-fn blind-fn encrypt-fn
                          decrypt-fn digest-fn scan-snapshot-fn]
   contract/IEngine
@@ -125,12 +374,14 @@
      :requests {}
      :snapshots {}
      :manifests {}
-     :metadata-head nil})
+     :metadata-head nil :metadata-root nil
+     :current-request-key nil :current-request nil})
 
   (-restore-state [_ physical-root opts]
     (let [node (validate-manifest (ipld/decode (get-fn physical-root))
                                   physical-root)]
-      (if (= 1 (get node "format-version"))
+      (case (get node "format-version")
+        1
         (let [database-id (get node "database-id")
               basis-t (get node "basis-t")
               snapshot-root (some-> (get node "snapshot") ipld/link-cid)
@@ -150,12 +401,14 @@
                        {:database-id database-id :basis-t basis-t :db db
                         :history history :requests requests
                         :snapshots snapshots :manifests manifests
-                        :metadata-head nil :physical-root physical-root})]
+                        :metadata-head nil :metadata-root nil
+                        :physical-root physical-root})]
           (if (:lazy? opts)
             (finish nil)
             (completion/then-result
              (arrangement/restore get-fn snapshot-root decrypt-fn)
              finish)))
+        2
         (let [database-id (get node "database-id")
               basis-t (get node "basis-t")
               snapshot-root (some-> (get node "snapshot") ipld/link-cid)
@@ -170,7 +423,40 @@
                              :history history :requests requests
                              :snapshots snapshots :manifests manifests
                              :metadata-head metadata-head
+                             :metadata-root nil
                              :physical-root physical-root})]
+               (if (:lazy? opts)
+                 (finish nil)
+                 (completion/then-result
+                  (arrangement/restore get-fn snapshot-root decrypt-fn)
+                  finish))))))
+        3
+        (let [database-id (get node "database-id")
+              basis-t (get node "basis-t")
+              snapshot-root (some-> (get node "snapshot") ipld/link-cid)
+              metadata-root (some-> (get node "metadata-root") ipld/link-cid)
+              current-key (get node "current-request-key")
+              _ (when-not (= metadata-index-format (get node "metadata-format"))
+                  (throw (ex-info "unsupported Prolly metadata index"
+                                  {:type :kotobase.engine/unsupported-metadata-index
+                                   :format (get node "metadata-format")})))]
+          (completion/then-result
+           (indexed-request-by-key commit-get-fn decrypt-fn metadata-root
+                                   current-key)
+           (fn [current]
+             (let [current (some-> current
+                                   (assoc :physical-root physical-root))
+                   finish
+                   (fn [db]
+                     {:database-id database-id :basis-t basis-t :db db
+                      :history nil
+                      :requests (if current {(:request-id current) current} {})
+                      :snapshots {basis-t snapshot-root}
+                      :manifests {basis-t physical-root}
+                      :metadata-head nil :metadata-root metadata-root
+                      :current-request-key current-key
+                      :current-request current
+                      :physical-root physical-root})]
                (if (:lazy? opts)
                  (finish nil)
                  (completion/then-result
@@ -183,76 +469,81 @@
                       {:type :kotobase.engine/database-mismatch})))
     (let [tx (canonical/normalize-tx tx-data)
           tx-root (digest this (canonical/transaction-string tx))]
-      (if-let [prior (get-in state [:requests request-id])]
-        (if (= tx-root (:tx-root prior))
-          {:state state
-           :receipt {:database-id database-id
-                     :epoch (:epoch prior)
-                     :request-id request-id
-                     :tx-root tx-root
-                     :physical-root (:physical-root prior)
-                     :engine prolly-profile
-                     :status :replayed}}
-          (throw (ex-info "request-id was already used for another transaction"
-                          {:type :kotobase.engine/idempotency-conflict
-                           :request-id request-id})))
-        (let [t (inc (:basis-t state))
-              db (when-some [materialized (:db state)]
-                   (reduce apply-datom materialized tx))
-              previous-snapshot (get-in state [:snapshots (:basis-t state)])
-              final-operations (->> tx
-                                    (reduce (fn [ops datom]
-                                              (assoc ops
-                                                     (canonical/logical-datom-key datom)
-                                                     datom))
-                                            {})
-                                    vals
-                                    (sort-by canonical/canonical-string)
-                                    vec)
-              assertions (->> final-operations
-                              (filter #(= :assert (:op %)))
-                              (mapv logical->quad))
-              retractions (->> final-operations
-                               (filter #(= :retract (:op %)))
-                               (mapv logical->quad))
-              appended (mapv (fn [{:keys [e a v op]}]
-                               {:e e :a a :v v :t t :added (= :assert op)})
-                             tx)]
-          (completion/then-result
-           (arrangement/commit-changes!
-            put! commit-get-fn previous-snapshot
-            {:assertions assertions :retractions retractions}
-            arrangement/current-schema-version blind-fn encrypt-fn)
-           (fn [snapshot-root]
-             (let [next-state (-> state
-                                  (assoc :basis-t t :db db)
-                                  (update :history into appended)
-                                  (assoc-in [:snapshots t] snapshot-root))
-                   current-request {:request-id request-id :tx-root tx-root}]
-               (completion/then-result
-                (metadata/persist-segment!
-                 put! encrypt-fn (:metadata-head state)
-                 {:epoch t :history appended :request current-request
-                  :snapshot-root snapshot-root
-                  :previous-physical-root (:physical-root state)})
-                (fn [metadata-head]
-                  (let [physical-root
-                        (ipld/put-node!
-                         put! (manifest-node next-state snapshot-root metadata-head))
-                        request-record (assoc current-request :epoch t
-                                              :physical-root physical-root)
-                        final-state (-> next-state
-                                        (assoc :metadata-head metadata-head
-                                               :physical-root physical-root)
-                                        (assoc-in [:manifests t] physical-root)
-                                        (assoc-in [:requests request-id]
-                                                  request-record))]
-                    {:state final-state
-                     :receipt {:database-id database-id :epoch t
-                               :request-id request-id :tx-root tx-root
-                               :physical-root physical-root
-                               :engine prolly-profile
-                               :status :committed}}))))))))))
+      (completion/then-result
+       (or (get-in state [:requests request-id])
+           (when (:metadata-root state)
+             (indexed-request commit-get-fn decrypt-fn blind-fn
+                              state request-id)))
+       (fn [prior]
+         (if prior
+           (if (= tx-root (:tx-root prior))
+             {:state state
+              :receipt {:database-id database-id :epoch (:epoch prior)
+                        :request-id request-id :tx-root tx-root
+                        :physical-root (:physical-root prior)
+                        :engine prolly-profile :status :replayed}}
+             (throw
+              (ex-info "request-id was already used for another transaction"
+                       {:type :kotobase.engine/idempotency-conflict
+                        :request-id request-id})))
+           (let [t (inc (:basis-t state))
+                 db (when-some [materialized (:db state)]
+                      (reduce apply-datom materialized tx))
+                 previous-snapshot (get-in state [:snapshots (:basis-t state)])
+                 final-operations
+                 (->> tx
+                      (reduce (fn [ops datom]
+                                (assoc ops (canonical/logical-datom-key datom)
+                                       datom))
+                              {})
+                      vals
+                      (sort-by canonical/canonical-string)
+                      vec)
+                 assertions (->> final-operations
+                                 (filter #(= :assert (:op %)))
+                                 (mapv logical->quad))
+                 retractions (->> final-operations
+                                  (filter #(= :retract (:op %)))
+                                  (mapv logical->quad))
+                 appended (mapv (fn [{:keys [e a v op]}]
+                                  {:e e :a a :v v :t t
+                                   :added (= :assert op)})
+                                tx)]
+             (completion/then-result
+              (arrangement/commit-changes!
+               put! commit-get-fn previous-snapshot
+               {:assertions assertions :retractions retractions}
+               arrangement/current-schema-version blind-fn encrypt-fn)
+              (fn [snapshot-root]
+                (let [next-state (assoc state :basis-t t :db db)
+                      current-request {:request-id request-id :tx-root tx-root
+                                       :epoch t}]
+                  (completion/then-result
+                   (commit-index! put! commit-get-fn encrypt-fn blind-fn state
+                                  t appended current-request final-operations)
+                   (fn [{:keys [root current-key]}]
+                     (let [physical-root
+                           (ipld/put-node!
+                            put! (manifest-node next-state snapshot-root root
+                                                current-key))
+                           request-record (assoc current-request
+                                                 :physical-root physical-root)
+                           final-state
+                           (assoc next-state
+                                  :history nil
+                                  :metadata-head nil :metadata-root root
+                                  :current-request-key current-key
+                                  :current-request request-record
+                                  :physical-root physical-root
+                                  :snapshots {t snapshot-root}
+                                  :manifests {t physical-root}
+                                  :requests {request-id request-record})]
+                       {:state final-state
+                        :receipt {:database-id database-id :epoch t
+                                  :request-id request-id :tx-root tx-root
+                                  :physical-root physical-root
+                                  :engine prolly-profile
+                                  :status :committed}}))))))))))))
 
   (-open-snapshot [_ state selector]
     (let [basis (:basis-t state)
@@ -264,46 +555,78 @@
       (if (zero? as-of)
         {:database-id (:database-id state) :basis-t 0
          :db (arrangement/empty-db) :history (:history state)
+         :metadata-root nil
          :history? (true? (:history selector))}
-        (let [snapshot-root (get-in state [:snapshots as-of])
-              finish (fn [db]
-                       {:database-id (:database-id state) :basis-t as-of :db db
-                        :snapshot-root snapshot-root
-                        :history (:history state)
-                        :history? (true? (:history selector))
-                        :physical-root (get-in state [:manifests as-of])})]
-          (if (and (nil? (:db state)) scan-snapshot-fn)
-            (finish nil)
-            (completion/then-result
-             (arrangement/restore get-fn snapshot-root decrypt-fn)
-             finish))))))
+        (completion/then-result
+         (or (get-in state [:snapshots as-of])
+             (when (:metadata-root state)
+               (indexed-epoch commit-get-fn (:metadata-root state) as-of)))
+         (fn [root-or-entry]
+           (let [entry? (map? root-or-entry)
+                 snapshot-root (if entry?
+                                 (some-> (get root-or-entry "snapshot")
+                                         ipld/link-cid)
+                                 root-or-entry)
+                 metadata-root (if entry?
+                                 (some-> (get root-or-entry "metadata-root")
+                                         ipld/link-cid)
+                                 (:metadata-root state))
+                 physical-root (if entry?
+                                 (some-> (get root-or-entry "manifest")
+                                         ipld/link-cid)
+                                 (get-in state [:manifests as-of]))
+                 finish (fn [db]
+                          {:database-id (:database-id state) :basis-t as-of
+                           :db db :snapshot-root snapshot-root
+                           :history (:history state)
+                           :metadata-root metadata-root
+                           :history? (true? (:history selector))
+                           :physical-root physical-root})]
+             (if (and (nil? (:db state)) scan-snapshot-fn)
+               (finish nil)
+               (completion/then-result
+                (arrangement/restore get-fn snapshot-root decrypt-fn)
+                finish))))))))
 
-  (-scan [_ {:keys [db snapshot-root basis-t history history?]} pattern opts]
+  (-scan [_ {:keys [db snapshot-root basis-t history history? metadata-root]}
+          pattern opts]
     (if history?
-      (->> history
-           (filter #(<= (:t %) basis-t))
-           canonical/canonical-datoms
-           (filter #(matches? pattern %))
-           vec)
+      (completion/then-result
+       (if (and (nil? history) metadata-root)
+         (indexed-history commit-get-fn decrypt-fn metadata-root)
+         history)
+       #(->> %
+             (filter (fn [datom] (<= (:t datom) basis-t)))
+             canonical/canonical-datoms
+             (filter (fn [datom] (matches? pattern datom)))
+             vec))
       (if db
-        (->> (visible-rows db history basis-t pattern)
-             (filter #(matches? pattern %)) vec)
+        (if history
+          (->> (visible-rows db history basis-t pattern)
+               (filter #(matches? pattern %)) vec)
+          (completion/then-result
+           (enrich-coordinates commit-get-fn decrypt-fn blind-fn metadata-root
+                               (visible-values db pattern))
+           #(->> % canonical/canonical-datoms
+                 (filter (fn [datom] (matches? pattern datom))) vec)))
         (if scan-snapshot-fn
-          (scan-snapshot-fn snapshot-root history basis-t pattern opts)
+          (scan-snapshot-fn snapshot-root history metadata-root basis-t pattern
+                            opts)
           (throw (ex-info "snapshot is lazy but no async cursor was injected"
                           {:type :kotobase.engine/missing-snapshot-cursor}))))))
 
-  (-history [_ {:keys [history basis-t]} _opts]
-    (->> history
-         (filter #(<= (:t %) basis-t))
-         canonical/canonical-datoms))
+  (-history [_ {:keys [history basis-t metadata-root]} _opts]
+    (completion/then-result
+     (if (and (nil? history) metadata-root)
+       (indexed-history commit-get-fn decrypt-fn metadata-root)
+       history)
+     #(->> % (filter (fn [datom] (<= (:t datom) basis-t)))
+            canonical/canonical-datoms)))
 
-  (-checkpoint [this {:keys [database-id basis-t db history physical-root]
+  (-checkpoint [this {:keys [database-id basis-t physical-root]
                       :as snapshot} _opts]
     (completion/then-result
-     (if db
-       (visible-rows db history basis-t)
-       (contract/-scan this snapshot [nil nil nil] {}))
+     (contract/-scan this snapshot [nil nil nil] {})
      (fn [rows]
        {:database-id database-id
         :epoch basis-t
