@@ -1,6 +1,6 @@
 (ns kotobase.engine.prolly.cursor
   "Direct asynchronous, range-pruned reads over Arrangement snapshots."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [arrangement.core :as arrangement]
             [ipld.core :as ipld]
             [ipld.value :as value]
