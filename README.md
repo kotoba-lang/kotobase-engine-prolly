@@ -47,6 +47,6 @@ advance only to reviewed revisions; generated manifests are not edited with
 invented SHAs.
 
 ```sh
-clojure -M:test
-clojure -M:lint
+kbb -M:test
+kbb -M:lint
 ```
