@@ -1,6 +1,6 @@
 (ns kotobase.engine.prolly
   "Typed Datom engine over string-valued Arrangement/Prolly primitives."
-  (:require [clojure.edn :as edn]
+  (:require [kotoba.lang.edn :as edn]
             [arrangement.core :as arrangement]
             [arrangement.query :as query]
             [ipld.core :as ipld]
