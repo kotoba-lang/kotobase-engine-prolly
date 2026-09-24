@@ -1,5 +1,5 @@
 (ns kotobase.engine.prolly-provider-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [kotoba.test :refer [deftest is]]
             [kotobase.engine.contract :as engine]
             [kotobase.engine.prolly.provider :as provider]
             [kotobase.storage.memory :as storage-memory]))
