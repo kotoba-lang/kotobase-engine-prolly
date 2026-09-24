@@ -1,6 +1,6 @@
 (ns kotobase.engine.prolly-test
   (:require [kotoba.lang.text :as str]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [arrangement.core :as arrangement]
             [ipld.core :as ipld]
             [kotobase.engine.conformance :as conformance]
